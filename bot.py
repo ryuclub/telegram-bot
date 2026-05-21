@@ -518,13 +518,62 @@ async def _send_long(message, text: str) -> None:
         await message.reply_text(text[i : i + CHUNK])
 
 
+_UPLOADS_DIR = Path(__file__).parent / "data" / "uploads"
+_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def _download_telegram_attachment(
+    context: ContextTypes.DEFAULT_TYPE, msg, user_id: int
+) -> tuple[Path | None, str]:
+    """私聊图片 / 文件 → 下载到 data/uploads/。
+    返 (本地 path, 描述文本)。无附件返 (None, "")。
+    """
+    file_obj = None
+    suffix = ""
+    label = ""
+
+    if msg.photo:  # PhotoSize list,取最大分辨率
+        file_obj = await context.bot.get_file(msg.photo[-1].file_id)
+        suffix = ".jpg"
+        label = "图片"
+    elif msg.document:
+        file_obj = await context.bot.get_file(msg.document.file_id)
+        suffix = Path(msg.document.file_name or "").suffix or ".bin"
+        label = f"文件({msg.document.file_name or '?'})"
+    elif msg.video:
+        file_obj = await context.bot.get_file(msg.video.file_id)
+        suffix = ".mp4"
+        label = "视频"
+    elif msg.voice:
+        file_obj = await context.bot.get_file(msg.voice.file_id)
+        suffix = ".ogg"
+        label = "语音"
+    elif msg.audio:
+        file_obj = await context.bot.get_file(msg.audio.file_id)
+        suffix = Path(msg.audio.file_name or "").suffix or ".mp3"
+        label = "音频"
+
+    if file_obj is None:
+        return None, ""
+
+    dest = _UPLOADS_DIR / f"{user_id}_{msg.message_id}{suffix}"
+    await file_obj.download_to_drive(custom_path=str(dest))
+    return dest, label
+
+
 async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     user = update.effective_user
-    if msg is None or not msg.text or user is None:
+    if msg is None or user is None:
+        return
+    # 任一支持类型:text / caption / photo / document / video / voice / audio
+    has_attachment = bool(
+        msg.photo or msg.document or msg.video or msg.voice or msg.audio
+    )
+    text_part = msg.text or msg.caption or ""
+    if not text_part and not has_attachment:
         return
     if user.id not in ADMIN_USER_IDS:
-        # 非 admin 私聊:静默忽略(/ping /id 仍可用)
         return
 
     # TOTP session gate
@@ -539,7 +588,22 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # 活跃 → 续 session 24h
     _touch_session(user.id)
 
-    prompt = msg.text
+    # 下载附件(如有)
+    attachment_path, attachment_label = await _download_telegram_attachment(
+        context, msg, user.id
+    )
+
+    # 构造 prompt — 含附件时告诉 Claude 路径(它用 Read tool 看图 / 文件)
+    if attachment_path:
+        path_rel = attachment_path.relative_to(Path(__file__).parent)
+        prompt_parts = [f"用户发了一个{attachment_label},保存在 ./{path_rel}"]
+        if text_part:
+            prompt_parts.append(f"caption / 附加说明:{text_part}")
+        prompt_parts.append("请用 Read tool 看这个文件并处理用户的需求。")
+        prompt = "\n\n".join(prompt_parts)
+    else:
+        prompt = text_part
+
     session_id = _chat_sessions.get(user.id)
 
     try:
@@ -983,9 +1047,13 @@ def main() -> None:
         )
     )
     # admin 私聊 → Claude Agent SDK chat(完整 tools,session 维持多轮)
+    # 支持 text / photo / document / video / voice / audio(附 caption);命令走 CommandHandler 不走这条
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            (filters.TEXT | filters.PHOTO | filters.Document.ALL
+             | filters.VIDEO | filters.VOICE | filters.AUDIO)
+            & ~filters.COMMAND
+            & filters.ChatType.PRIVATE,
             on_admin_private,
         )
     )
