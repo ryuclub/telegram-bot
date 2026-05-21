@@ -25,6 +25,13 @@ import httpx
 
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    TextBlock,
+    query as claude_query,
+)
 from dotenv import load_dotenv
 from telegram import (
     ChatMemberUpdated,
@@ -33,7 +40,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.constants import MessageEntityType
+from telegram.constants import ChatAction, MessageEntityType
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -254,6 +261,269 @@ async def cmd_id(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "\n".join(lines), parse_mode="Markdown"
     )
+
+
+# === Admin private chat — Claude Agent SDK with full tools(Bash/Read/Write/Edit/etc) ===
+# 验证(两层):
+#   1. user.id ∈ ADMIN_USER_IDS
+#   2. TOTP /auth 通过 → 24h session,每次活跃自动续期 24h(/logout 主动结束)
+# permission_mode="bypassPermissions" = 完全跳过 y/n 确认,等于 telegram admin 远控 botuser 账号
+# 全部能力(含 NOPASSWD sudo)。session_id 维持多轮;/reset 清当前 user 的 claude session。
+
+import pyotp
+
+_TOTP_SECRET_FILE = Path(__file__).parent / ".totp-secret"
+_TOTP_LOCK_MAX_FAILS = 5
+_TOTP_LOCK_DURATION = timedelta(minutes=15)
+_SESSION_DURATION = timedelta(hours=24)
+_BOT_NAME = "telegram-bot"
+
+
+def _load_or_create_totp_secret() -> str:
+    """启动时调用。文件存在 → 返已存 secret;不存在 → 生成 + 写 600 perm + 返。"""
+    if _TOTP_SECRET_FILE.exists():
+        return _TOTP_SECRET_FILE.read_text().strip()
+    secret = pyotp.random_base32()
+    _TOTP_SECRET_FILE.write_text(secret)
+    _TOTP_SECRET_FILE.chmod(0o600)
+    return secret
+
+
+_TOTP_SECRET = _load_or_create_totp_secret()
+_TOTP_NEEDS_SETUP_DM = not (Path(__file__).parent / ".totp-setup-done").exists()
+
+
+def _make_totp_provisioning_uri() -> str:
+    issuer = _BOT_NAME
+    label = f"{issuer}:admin"
+    return pyotp.totp.TOTP(_TOTP_SECRET).provisioning_uri(name=label, issuer_name=issuer)
+
+
+# Claude Agent session(per user_id 续多轮)
+_chat_sessions: dict[int, str] = {}
+# Auth session:user_id -> last_active datetime;过期(now - last_active > 24h)= 需重 /auth
+_auth_sessions: dict[int, datetime] = {}
+# TOTP 失败 lock:user_id -> (fail_count, lock_until)
+_totp_fails: dict[int, tuple[int, datetime | None]] = {}
+# Chat model 选择(per user_id);None = SDK 默认(跟 Claude Code 配置)
+_user_chat_model: dict[int, str] = {}
+
+# 预设可选 model 列表(`/model` 列出 + key 短输入)
+_CHAT_MODEL_PRESETS = {
+    "opus": "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+}
+
+
+def _is_authed(user_id: int) -> bool:
+    last = _auth_sessions.get(user_id)
+    if last is None:
+        return False
+    return (datetime.now(timezone.utc) - last) < _SESSION_DURATION
+
+
+def _touch_session(user_id: int) -> None:
+    """活跃 → 重置 last_active(续期 24h)"""
+    _auth_sessions[user_id] = datetime.now(timezone.utc)
+
+_AGENT_SYSTEM_PROMPT = """\
+你是 telegram 群管理 bot 内嵌的助手,通过私聊跟管理员(botuser)交互。
+你跑在管理员的 Ubuntu 机器上,拥有完整 Claude Code tools(Bash / Read / Write / Edit 等)。
+回复尽量简洁、用 plain text(Telegram 不解析 markdown),避免过长输出。
+"""
+
+
+async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is None or user.id not in ADMIN_USER_IDS:
+        await update.effective_message.reply_text("权限不足。")
+        return
+    had = _chat_sessions.pop(user.id, None)
+    txt = "✅ 会话已清,下条消息开新对话。" if had else "(本来就没活跃会话)"
+    await update.effective_message.reply_text(txt)
+
+
+async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/auth <6 位 TOTP>` — 验证后开 24h session,活跃自动续期。"""
+    user = update.effective_user
+    msg = update.effective_message
+    if user is None or user.id not in ADMIN_USER_IDS:
+        await msg.reply_text("权限不足。")
+        return
+
+    # check lock
+    fails, lock_until = _totp_fails.get(user.id, (0, None))
+    now = datetime.now(timezone.utc)
+    if lock_until and now < lock_until:
+        remaining = int((lock_until - now).total_seconds() / 60) + 1
+        await msg.reply_text(f"🔒 失败次数过多,锁定 {remaining} 分钟后重试。")
+        return
+
+    # 解析 /auth <code>
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply_text("用法:`/auth <6 位数字>`(从 Authenticator app 看)", parse_mode="Markdown")
+        return
+    code = parts[1].strip()
+
+    # 立即删 telegram 含 code 的消息(防 history 泄漏)
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+
+    # 验
+    totp = pyotp.TOTP(_TOTP_SECRET)
+    if totp.verify(code, valid_window=1):  # ±30s 容忍时钟漂移
+        _touch_session(user.id)
+        _totp_fails.pop(user.id, None)
+        await context.bot.send_message(
+            user.id,
+            f"✅ 验证通过。24h session 已开,每次发消息自动续 24h。\n`/logout` 主动结束。",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 失败
+    fails += 1
+    if fails >= _TOTP_LOCK_MAX_FAILS:
+        _totp_fails[user.id] = (0, now + _TOTP_LOCK_DURATION)
+        await context.bot.send_message(
+            user.id,
+            f"❌ 验证失败 {fails} 次,锁定 15 分钟。",
+        )
+        log.warning("totp lock user=%s", user.id)
+    else:
+        _totp_fails[user.id] = (fails, None)
+        await context.bot.send_message(
+            user.id,
+            f"❌ 验证失败({fails}/{_TOTP_LOCK_MAX_FAILS})。",
+        )
+
+
+async def cmd_logout(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+    if user is None or user.id not in ADMIN_USER_IDS:
+        await msg.reply_text("权限不足。")
+        return
+    had = _auth_sessions.pop(user.id, None)
+    _chat_sessions.pop(user.id, None)  # 顺便清 claude session
+    txt = "✅ 已 logout,session + 对话历史已清。" if had else "(本来就没 session)"
+    await msg.reply_text(txt)
+
+
+async def cmd_model(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/model` 显当前;`/model <preset|full-name>` 切换。仅 admin。"""
+    user = update.effective_user
+    msg = update.effective_message
+    if user is None or user.id not in ADMIN_USER_IDS:
+        await msg.reply_text("权限不足。")
+        return
+
+    parts = (msg.text or "").split(maxsplit=1)
+    current = _user_chat_model.get(user.id) or "(默认,Claude Code 配置)"
+
+    if len(parts) < 2:
+        # 列预设 + 当前
+        preset_lines = "\n".join(f"  `/model {k}` → `{v}`" for k, v in _CHAT_MODEL_PRESETS.items())
+        await msg.reply_text(
+            f"当前 chat model: `{current}`\n\n预设(切换):\n{preset_lines}\n\n"
+            f"或自定:`/model <完整 model 名>` 或 `/model reset` 恢复默认。",
+            parse_mode="Markdown",
+        )
+        return
+
+    arg = parts[1].strip()
+    if arg == "reset" or arg == "default":
+        _user_chat_model.pop(user.id, None)
+        await msg.reply_text("✅ 已恢复默认 model。")
+        return
+
+    target = _CHAT_MODEL_PRESETS.get(arg, arg)  # 预设 key 或直接 full name
+    _user_chat_model[user.id] = target
+    await msg.reply_text(f"✅ chat model 切为 `{target}`。", parse_mode="Markdown")
+
+
+async def _send_long(message, text: str) -> None:
+    """Telegram 单条 4096 chars 上限,长输出分段。"""
+    CHUNK = 4000
+    if not text:
+        text = "(空响应)"
+    for i in range(0, len(text), CHUNK):
+        await message.reply_text(text[i : i + CHUNK])
+
+
+async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or not msg.text or user is None:
+        return
+    if user.id not in ADMIN_USER_IDS:
+        # 非 admin 私聊:静默忽略(/ping /id 仍可用)
+        return
+
+    # TOTP session gate
+    if not _is_authed(user.id):
+        await msg.reply_text(
+            "🔒 未授权,请先 `/auth <6 位 TOTP>`(从 Authenticator app 看)。"
+            "\n首次使用先扫 setup QR(bot 启动时已 DM 给你)。",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 活跃 → 续 session 24h
+    _touch_session(user.id)
+
+    prompt = msg.text
+    session_id = _chat_sessions.get(user.id)
+
+    try:
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+    except TelegramError:
+        pass
+
+    options = ClaudeAgentOptions(
+        system_prompt=_AGENT_SYSTEM_PROMPT,
+        permission_mode="bypassPermissions",
+        resume=session_id,
+        max_turns=20,
+        max_budget_usd=0.50,
+        model=_user_chat_model.get(user.id),  # None = SDK 默认
+    )
+
+    collected: list[str] = []
+    new_session_id: str | None = None
+    err: str | None = None
+
+    try:
+        async for m in claude_query(prompt=prompt, options=options):
+            if isinstance(m, AssistantMessage):
+                for block in m.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        collected.append(block.text)
+                if m.session_id:
+                    new_session_id = m.session_id
+            elif isinstance(m, ResultMessage):
+                if m.session_id:
+                    new_session_id = m.session_id
+                if m.is_error and m.errors:
+                    err = "; ".join(m.errors)
+    except Exception as e:
+        log.exception("agent query failed for user=%s", user.id)
+        err = f"agent 错误:{type(e).__name__}: {e}"
+
+    if new_session_id:
+        _chat_sessions[user.id] = new_session_id
+
+    response = "\n".join(s for s in collected if s).strip()
+    if err and not response:
+        response = f"⚠️ {err}"
+    elif err:
+        response += f"\n\n⚠️ {err}"
+
+    await _send_long(msg, response)
 
 
 async def _notify_admin(context: ContextTypes.DEFAULT_TYPE, body: str) -> None:
@@ -614,13 +884,45 @@ def main() -> None:
         raise SystemExit("TELEGRAM_BOT_TOKEN missing in .env")
     # LLM key 检查已在 module 加载时(llm_router 初始化)完成。
 
+    # 启动时 log TOTP setup URL 到 stderr(journalctl 看;首次 setup 扫这个 URL)
+    setup_uri = _make_totp_provisioning_uri()
+    log.warning("=== TOTP setup URI(扫这个 URL / 输入 secret 到 Authenticator app)===")
+    log.warning("URL: %s", setup_uri)
+    log.warning("Secret: %s", _TOTP_SECRET)
+    log.warning("ASCII QR(扫码):")
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(setup_uri)
+        qr.make()
+        # ASCII art 到 log
+        import io
+        buf = io.StringIO()
+        qr.print_ascii(out=buf, invert=True)
+        for line in buf.getvalue().splitlines():
+            log.warning("  %s", line)
+    except Exception as e:
+        log.warning("(QR 生成失败 — 直接复制 secret 输入 app: %s)", e)
+    log.warning("=== END TOTP setup ===")
+
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("auth", cmd_auth))
+    app.add_handler(CommandHandler("logout", cmd_logout))
+    app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
             on_message,
+        )
+    )
+    # admin 私聊 → Claude Agent SDK chat(完整 tools,session 维持多轮)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            on_admin_private,
         )
     )
     app.add_handler(

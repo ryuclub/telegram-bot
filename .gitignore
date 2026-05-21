@@ -9,3 +9,4 @@ venv/
 *.session-journal
 .DS_Store
 data/
+.totp-secret
