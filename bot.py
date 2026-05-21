@@ -72,6 +72,11 @@ RECIDIVIST_WINDOW = timedelta(hours=2)
 RECIDIVIST_THRESHOLD = 2  # >=2 次删触发 ban
 _delete_history: dict[int, deque[datetime]] = defaultdict(deque)
 
+# delete_ban 时同步清该用户近 24h 全部消息(包括之前 classify 没拦住的广告)。
+# 内存 dict 重启丢,接受 — 24h 窗口 + bot 通常长跑。
+USER_HISTORY_WINDOW = timedelta(hours=24)
+_user_messages: dict[int, deque[tuple[int, datetime]]] = defaultdict(deque)
+
 # 入群验证
 VERIFY_ENABLED = os.environ.get("VERIFY_ENABLED", "true").lower() in ("1", "true", "yes")
 VERIFY_TIMEOUT_SECONDS = int(os.environ.get("VERIFY_TIMEOUT_SECONDS", "90"))
@@ -129,6 +134,34 @@ def _record_delete(user_id: int, when: datetime) -> int:
         history.popleft()
     history.append(when)
     return len(history)
+
+
+def _record_user_message(user_id: int, message_id: int, when: datetime) -> None:
+    """记录用户每条非命令文本消息 + 自动淘汰 > USER_HISTORY_WINDOW 的老条目。"""
+    history = _user_messages[user_id]
+    cutoff = when - USER_HISTORY_WINDOW
+    while history and history[0][1] < cutoff:
+        history.popleft()
+    history.append((message_id, when))
+
+
+async def _purge_user_recent_messages(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int
+) -> int:
+    """delete_ban 时调用,删该用户近 USER_HISTORY_WINDOW 内全部 bot 看到的消息。
+    返删除成功条数。Telegram 普通 bot 仅能删 < 48h 消息,super group + admin bot 可删该 user 任意 msg_id;
+    单条 delete_message 失败(老 / 已删 / 权限)silent skip。"""
+    history = _user_messages.pop(user_id, None)
+    if not history:
+        return 0
+    deleted = 0
+    for mid, _ in list(history):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except TelegramError:
+            pass
+    return deleted
 
 
 def _log_verdict(update: Update, verdict: Verdict) -> None:
@@ -296,6 +329,11 @@ async def _act(
             await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id)
         except TelegramError as e:
             log.warning("ban failed: %s", e)
+        # 同步清该用户近 24h bot 看过的全部消息(覆盖之前漏拦的广告)
+        purged = await _purge_user_recent_messages(context, chat.id, user.id)
+        if purged > 0:
+            log.warning("delete_ban: purged %d recent messages from user=%s", purged, user.id)
+            await _notify_admin(context, f"🧹 已清该用户近 24h 内 {purged} 条历史消息")
 
 
 async def _kick(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, why: str) -> None:
@@ -495,6 +533,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # bot 自己豁免
     if user and user.is_bot:
         return
+
+    # 记进该用户 24h history(无论 spam 与否)— delete_ban 时一并清,
+    # 覆盖之前 classify 没拦住的广告(用户需求)
+    if user:
+        _record_user_message(user.id, msg.message_id, msg.date or datetime.now(timezone.utc))
 
     log.info(
         "[%s/%s] %s(@%s): %s",
