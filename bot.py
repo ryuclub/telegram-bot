@@ -437,6 +437,10 @@ async def _get_or_create_client_session(user_id: int) -> _ClientSession:
         max_turns=50,
         max_budget_usd=5.0,
         model=_user_chat_model.get(user_id),
+        # 关键:.env 里的 ANTHROPIC_API_KEY 让 CLI 走 API 计费(用户的 monthly spend limit)。
+        # 清空让 CLI fall back 到 Claude Code OAuth 订阅(包月,不计 token)。
+        # classifier 那条路在主进程内调 anthropic SDK,仍能用 env 里的 API key 作 fallback。
+        env={"ANTHROPIC_API_KEY": ""},
     )
     s = _ClientSession(options)
     await s.ensure_connected()
@@ -763,15 +767,42 @@ async def _notify_admin(context: ContextTypes.DEFAULT_TYPE, body: str) -> None:
 
 
 def _has_link(msg) -> bool:
-    if not msg.entities:
-        return False
+    entities = (msg.entities or []) + (msg.caption_entities or [])
+    if not entities:
+        # link_preview 也算
+        lpo = getattr(msg, "link_preview_options", None)
+        return bool(lpo and getattr(lpo, "url", None))
     link_types = {
         MessageEntityType.URL,
         MessageEntityType.TEXT_LINK,
         MessageEntityType.MENTION,
         MessageEntityType.TEXT_MENTION,
     }
-    return any(e.type in link_types for e in msg.entities)
+    return any(e.type in link_types for e in entities)
+
+
+def _extract_links_mentions(msg) -> list[str]:
+    """从 entities + caption_entities + link_preview 抽 URL/text_link/@mention,
+    给 LLM 看 — 防止"text='i' 但藏隐藏链接"这种诱饵广告漏判。"""
+    out: list[str] = []
+    text = msg.text or msg.caption or ""
+    entities = (msg.entities or []) + (msg.caption_entities or [])
+    for e in entities:
+        et = e.type
+        if et == MessageEntityType.URL:
+            out.append(text[e.offset : e.offset + e.length])
+        elif et == MessageEntityType.TEXT_LINK and e.url:
+            visible = text[e.offset : e.offset + e.length]
+            out.append(f"{visible!r}→{e.url}")
+        elif et == MessageEntityType.MENTION:
+            out.append(text[e.offset : e.offset + e.length])
+        elif et == MessageEntityType.TEXT_MENTION and e.user:
+            uname = e.user.username or e.user.full_name or "?"
+            out.append(f"@{uname}(id={e.user.id})")
+    lpo = getattr(msg, "link_preview_options", None)
+    if lpo and getattr(lpo, "url", None):
+        out.append(f"[link_preview→{lpo.url}]")
+    return out
 
 
 async def _act(
