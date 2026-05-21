@@ -46,7 +46,7 @@ from telegram.ext import (
     filters,
 )
 
-from classifier import Verdict, classify
+from classifier import LLMRouter, Verdict
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -66,19 +66,47 @@ GROUP_CHAT_ID = (
 )
 NOTIFY_ADMIN_ID = next(iter(ADMIN_USER_IDS), None)  # DM 第一个管理员
 
-# LLM provider 选择 — `claude`(默认,Anthropic 原生 + prompt caching)/ `openai`(OpenAI 兼容,
-# 含 DeepSeek。配 OPENAI_API_KEY + OPENAI_BASE_URL + OPENAI_MODEL,DeepSeek 时 base_url=
-# https://api.deepseek.com/v1,model=deepseek-chat / deepseek-reasoner)。
-_LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "claude").lower()
-if _LLM_PROVIDER == "claude":
-    llm_client = AsyncAnthropic()  # 自动读 ANTHROPIC_API_KEY
-elif _LLM_PROVIDER == "openai":
-    llm_client = AsyncOpenAI(
+# LLM provider 路由 —
+#   - 显式 LLM_PROVIDER=claude / openai → 单 provider,无 fallback
+#   - 未显式设(默认):双 key 都配 → openai primary(便宜,DeepSeek 等)+ claude fallback
+#                      只 openai key   → openai 单(无 fallback)
+#                      只 claude key   → claude 单(无 fallback)
+#                      都没           → SystemExit
+def _make_claude() -> AsyncAnthropic:
+    return AsyncAnthropic()  # 自动读 ANTHROPIC_API_KEY
+
+
+def _make_openai() -> AsyncOpenAI:
+    return AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ.get("OPENAI_BASE_URL") or None,  # 空 → openai.com 官方
     )
+
+
+_LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "").lower()
+_has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+_has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+
+if _LLM_PROVIDER == "claude":
+    if not _has_anthropic:
+        raise SystemExit("ANTHROPIC_API_KEY missing(LLM_PROVIDER=claude)")
+    llm_router = LLMRouter(_make_claude(), fallback=None)
+elif _LLM_PROVIDER == "openai":
+    if not _has_openai:
+        raise SystemExit("OPENAI_API_KEY missing(LLM_PROVIDER=openai)")
+    llm_router = LLMRouter(_make_openai(), fallback=None)
+elif _LLM_PROVIDER == "":
+    # 自动 — 双 key → openai 主 / claude 备;单 key → 单 provider
+    if _has_openai and _has_anthropic:
+        llm_router = LLMRouter(_make_openai(), fallback=_make_claude())
+    elif _has_openai:
+        llm_router = LLMRouter(_make_openai(), fallback=None)
+    elif _has_anthropic:
+        llm_router = LLMRouter(_make_claude(), fallback=None)
+    else:
+        raise SystemExit("需 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 至少一个")
 else:
-    raise SystemExit(f"unknown LLM_PROVIDER={_LLM_PROVIDER!r},需 claude 或 openai")
+    raise SystemExit(f"unknown LLM_PROVIDER={_LLM_PROVIDER!r},需 claude / openai / 空")
 
 # 累犯升级:同一 user 2 小时内被自动删 ≥ 2 次,直接 ban
 RECIDIVIST_WINDOW = timedelta(hours=2)
@@ -562,8 +590,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
     try:
-        verdict = await classify(
-            llm_client,
+        verdict = await llm_router.classify(
             text=msg.text,
             sender_name=user.full_name if user else "?",
             sender_username=user.username if user else None,
@@ -571,7 +598,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             is_forwarded=bool(msg.forward_origin),
         )
     except Exception:
-        log.exception("classify failed — leaving message alone")
+        log.exception("classify failed(primary+fallback all errored) — leaving message alone")
         return
 
     await _act(context, update, verdict)
@@ -585,10 +612,7 @@ def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN missing in .env")
-    if _LLM_PROVIDER == "claude" and not os.environ.get("ANTHROPIC_API_KEY"):
-        raise SystemExit("ANTHROPIC_API_KEY missing in .env(LLM_PROVIDER=claude)")
-    if _LLM_PROVIDER == "openai" and not os.environ.get("OPENAI_API_KEY"):
-        raise SystemExit("OPENAI_API_KEY missing in .env(LLM_PROVIDER=openai)")
+    # LLM key 检查已在 module 加载时(llm_router 初始化)完成。
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("ping", cmd_ping))

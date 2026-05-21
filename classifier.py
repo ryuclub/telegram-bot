@@ -305,6 +305,59 @@ async def _classify_openai(
     return _parse_verdict(text_out)
 
 
+def _client_label(client: LLMClient) -> str:
+    if isinstance(client, AsyncAnthropic):
+        return "claude"
+    if isinstance(client, AsyncOpenAI):
+        return "openai"
+    return "unknown"
+
+
+async def _classify_one(client: LLMClient, user_block: str) -> Verdict:
+    if isinstance(client, AsyncAnthropic):
+        model = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
+        return await _classify_claude(client, user_block, model)
+    if isinstance(client, AsyncOpenAI):
+        # DeepSeek 默认 deepseek-chat;OpenAI 走时改 gpt-4o-mini 之类(by env)
+        model = os.environ.get("OPENAI_MODEL", "deepseek-chat")
+        return await _classify_openai(client, user_block, model)
+    raise TypeError(f"unsupported LLM client type: {type(client).__name__}")
+
+
+class LLMRouter:
+    """双 provider 自动 fallback:primary 失败 → 切 fallback。
+
+    典型用法:openai(便宜,如 DeepSeek)作 primary,Claude 作 fallback 保 SLA。
+    单 provider 时 fallback=None,primary 失败直接抛。
+    """
+
+    def __init__(self, primary: LLMClient, fallback: LLMClient | None = None):
+        self.primary = primary
+        self.fallback = fallback
+        self.primary_label = _client_label(primary)
+        self.fallback_label = _client_label(fallback) if fallback else None
+
+    async def classify(
+        self, *, text: str, sender_name: str, sender_username: str | None,
+        has_link: bool, is_forwarded: bool,
+    ) -> Verdict:
+        user_block = _build_user_block(
+            text=text, sender_name=sender_name, sender_username=sender_username,
+            has_link=has_link, is_forwarded=is_forwarded,
+        )
+        try:
+            return await _classify_one(self.primary, user_block)
+        except Exception as e:
+            if not self.fallback:
+                raise
+            log.warning(
+                "primary %s failed: %r — fallback to %s",
+                self.primary_label, e, self.fallback_label,
+            )
+            return await _classify_one(self.fallback, user_block)
+
+
+# 老 signature 保留(直接传 client),复用 LLMRouter 单 provider 模式。
 async def classify(
     client: LLMClient,
     *,
@@ -314,15 +367,7 @@ async def classify(
     has_link: bool,
     is_forwarded: bool,
 ) -> Verdict:
-    user_block = _build_user_block(
+    return await LLMRouter(client).classify(
         text=text, sender_name=sender_name, sender_username=sender_username,
         has_link=has_link, is_forwarded=is_forwarded,
     )
-    if isinstance(client, AsyncAnthropic):
-        model = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
-        return await _classify_claude(client, user_block, model)
-    if isinstance(client, AsyncOpenAI):
-        # DeepSeek 默认 deepseek-chat;OpenAI 走时改 gpt-4o-mini 之类(by env)
-        model = os.environ.get("OPENAI_MODEL", "deepseek-chat")
-        return await _classify_openai(client, user_block, model)
-    raise TypeError(f"unsupported LLM client type: {type(client).__name__}")

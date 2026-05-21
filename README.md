@@ -17,25 +17,31 @@ sudo systemctl enable --now telegram-bot
 
 `DRY_RUN=true` 只打日志不真删真踢。
 
-## LLM provider 切换
+## LLM provider 路由
 
-**Claude(默认)**:
+**自动模式(推荐,默认)** — `LLM_PROVIDER` 留空:
+- 两 key 都配 → **openai 主**(便宜,DeepSeek 等)+ **claude 备**(primary 失败自动接手)
+- 只 openai → openai 单
+- 只 claude → claude 单
+
 ```
-LLM_PROVIDER=claude
+# 双配 — openai 主 / claude 备
 ANTHROPIC_API_KEY=sk-ant-...
-```
-含 prompt caching,每次调用 cached_write ~5K tokens 命中复用。
-
-**DeepSeek**(走 OpenAI 兼容 endpoint):
-```
-LLM_PROVIDER=openai
-OPENAI_API_KEY=sk-...                  # DeepSeek API key
+OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.deepseek.com/v1
-OPENAI_MODEL=deepseek-chat             # 或 deepseek-reasoner
+OPENAI_MODEL=deepseek-chat
 ```
-DeepSeek 价格比 Claude Haiku 便宜 3-5× + 中文洗钱黑话识别熟,但无 Anthropic-style prompt caching(DeepSeek 服务端有自动 cache,大部分 system prompt token 命中)。
 
-**OpenAI 官方 / 其它 OpenAI 兼容服务**:同上,`OPENAI_BASE_URL` 留空 / 改成对应 endpoint,`OPENAI_MODEL` 改对应名。
+failover 触发:openai 抛任何 exception(API 错 / 429 / 网络断)→ log warning → 自动重试 claude。log 看 `primary openai failed: ... — fallback to claude`。
+
+**显式强制单 provider**(无 fallback):
+```
+LLM_PROVIDER=claude         # 强制 claude,即使配了 openai 也不用
+LLM_PROVIDER=openai         # 强制 openai,失败不切 claude
+```
+
+**Claude 提供商详情**:Anthropic 原生 + prompt caching(cached_write ~5K tokens 复用)。
+**OpenAI 兼容详情**:`OPENAI_BASE_URL` 决定 endpoint(DeepSeek / OpenAI / Together / etc),`OPENAI_MODEL` 决定 model。DeepSeek 价格比 Claude Haiku 便宜 3-5× + 中文洗钱黑话识别熟。
 
 切换后 `update.sh` 重启即生效。
 
