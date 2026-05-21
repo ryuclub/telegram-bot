@@ -558,6 +558,25 @@ async def _download_telegram_attachment(
 
     dest = _UPLOADS_DIR / f"{user_id}_{msg.message_id}{suffix}"
     await file_obj.download_to_drive(custom_path=str(dest))
+
+    # 写 INDEX.jsonl 一行 — Claude 后续 `Read data/uploads/INDEX.jsonl` 找历史素材
+    caption = msg.caption or msg.text or ""
+    index_entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "user_id": user_id,
+        "msg_id": msg.message_id,
+        "type": label,
+        "filename": dest.name,
+        "path": str(dest.relative_to(Path(__file__).parent)),
+        "caption": caption,
+    }
+    try:
+        index_file = _UPLOADS_DIR / "INDEX.jsonl"
+        with index_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(index_entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning("uploads index append failed: %s", e)
+
     return dest, label
 
 
