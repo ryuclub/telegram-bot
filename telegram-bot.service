@@ -17,7 +17,8 @@ StandardError=journal
 SyslogIdentifier=telegram-bot
 
 # Hardening
-NoNewPrivileges=true
+# 注意:NoNewPrivileges 不开 — admin 私聊 Claude Agent 需要 sudo(docker / systemctl 等)。
+# 跟"路径 1 接受 bypassPermissions(telegram admin 拿 botuser NOPASSWD sudo 全权)"意图一致。
 PrivateTmp=true
 ProtectSystem=strict
 # Claude Agent SDK spawn bundled `claude` CLI 需要写 ~/.claude(sessions / settings / statsig)。
