@@ -1,0 +1,27 @@
+[Unit]
+Description=Telegram group moderation bot (Claude-powered)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/home/botuser/telegram-bot
+EnvironmentFile=/home/botuser/telegram-bot/.env
+ExecStart=/home/botuser/telegram-bot/.venv/bin/python -u bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegram-bot
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/botuser/telegram-bot
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
