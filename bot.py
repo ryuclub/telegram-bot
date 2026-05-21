@@ -28,6 +28,7 @@ from openai import AsyncOpenAI
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     ResultMessage,
     TextBlock,
     query as claude_query,
@@ -389,6 +390,85 @@ _AGENT_SYSTEM_PROMPT = """\
 """
 
 
+# === ClaudeSDKClient 长连接池 — per-user 复用 subprocess + prompt cache ===
+# 首次消息 spawn `claude` 进程,后续消息复用同进程(prompt cache 命中);
+# IDLE_TIMEOUT 无活动 → 关 subprocess 释放内存。
+_IDLE_TIMEOUT = timedelta(minutes=30)
+_CLIENT_CLEANUP_INTERVAL = 60  # 秒
+
+
+class _ClientSession:
+    """per-user ClaudeSDKClient + lock + last_used 追踪。"""
+
+    def __init__(self, options: ClaudeAgentOptions):
+        self.options = options
+        self.client = ClaudeSDKClient(options=options)
+        self.last_used = datetime.now(timezone.utc)
+        self.lock = asyncio.Lock()  # 防同一 user 并发多消息
+        self.connected = False
+
+    async def ensure_connected(self) -> None:
+        if not self.connected:
+            await self.client.connect()
+            self.connected = True
+
+    async def close(self) -> None:
+        if self.connected:
+            try:
+                await self.client.disconnect()
+            except Exception as e:
+                log.warning("client disconnect err: %s", e)
+            self.connected = False
+
+
+_client_sessions: dict[int, _ClientSession] = {}
+
+
+async def _get_or_create_client_session(user_id: int) -> _ClientSession:
+    """有 client 用现成的;无则按 user 当前 session_id + model 新建并 connect。"""
+    s = _client_sessions.get(user_id)
+    if s is not None:
+        s.last_used = datetime.now(timezone.utc)
+        return s
+    options = ClaudeAgentOptions(
+        system_prompt=_AGENT_SYSTEM_PROMPT,
+        permission_mode="bypassPermissions",
+        resume=_chat_sessions.get(user_id),  # 上次的 claude session_id;None = 新对话
+        max_turns=50,
+        max_budget_usd=5.0,
+        model=_user_chat_model.get(user_id),
+    )
+    s = _ClientSession(options)
+    await s.ensure_connected()
+    _client_sessions[user_id] = s
+    return s
+
+
+async def _close_client_session(user_id: int) -> None:
+    s = _client_sessions.pop(user_id, None)
+    if s is not None:
+        await s.close()
+
+
+async def _client_idle_cleanup_loop() -> None:
+    """每分钟扫,关 30 min 无活动 client。"""
+    while True:
+        try:
+            await asyncio.sleep(_CLIENT_CLEANUP_INTERVAL)
+            now = datetime.now(timezone.utc)
+            for uid in list(_client_sessions.keys()):
+                s = _client_sessions.get(uid)
+                if s is None or s.lock.locked():
+                    continue
+                if (now - s.last_used) > _IDLE_TIMEOUT:
+                    log.info("client idle cleanup user=%s", uid)
+                    await _close_client_session(uid)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("client idle cleanup loop err")
+
+
 async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user is None or user.id not in ADMIN_USER_IDS:
@@ -397,6 +477,8 @@ async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     had = _chat_sessions.pop(user.id, None)
     if had:
         _save_state()
+    # 关现有 client,下条消息会重建(无 resume = 全新对话)
+    await _close_client_session(user.id)
     txt = "✅ 会话已清,下条消息开新对话。" if had else "(本来就没活跃会话)"
     await update.effective_message.reply_text(txt)
 
@@ -471,6 +553,7 @@ async def cmd_logout(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     had = _auth_sessions.pop(user.id, None)
     _chat_sessions.pop(user.id, None)  # 顺便清 claude session
     _save_state()
+    await _close_client_session(user.id)  # 关持久 client subprocess
     txt = "✅ 已 logout,session + 对话历史已清。" if had else "(本来就没 session)"
     await msg.reply_text(txt)
 
@@ -506,6 +589,8 @@ async def cmd_model(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     target = _CHAT_MODEL_PRESETS.get(arg, arg)  # 预设 key 或直接 full name
     _user_chat_model[user.id] = target
     _save_state()
+    # 关现有 client,下次重建用新 model
+    await _close_client_session(user.id)
     await msg.reply_text(f"✅ chat model 切为 `{target}`。", parse_mode="Markdown")
 
 
@@ -623,42 +708,37 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         prompt = text_part
 
-    session_id = _chat_sessions.get(user.id)
-
     try:
         await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
     except TelegramError:
         pass
-
-    options = ClaudeAgentOptions(
-        system_prompt=_AGENT_SYSTEM_PROMPT,
-        permission_mode="bypassPermissions",
-        resume=session_id,
-        max_turns=20,
-        max_budget_usd=0.50,
-        model=_user_chat_model.get(user.id),  # None = SDK 默认
-    )
 
     collected: list[str] = []
     new_session_id: str | None = None
     err: str | None = None
 
     try:
-        async for m in claude_query(prompt=prompt, options=options):
-            if isinstance(m, AssistantMessage):
-                for block in m.content:
-                    if isinstance(block, TextBlock) and block.text:
-                        collected.append(block.text)
-                if m.session_id:
-                    new_session_id = m.session_id
-            elif isinstance(m, ResultMessage):
-                if m.session_id:
-                    new_session_id = m.session_id
-                if m.is_error and m.errors:
-                    err = "; ".join(m.errors)
+        session = await _get_or_create_client_session(user.id)
+        async with session.lock:
+            await session.client.query(prompt)
+            async for m in session.client.receive_response():
+                if isinstance(m, AssistantMessage):
+                    for block in m.content:
+                        if isinstance(block, TextBlock) and block.text:
+                            collected.append(block.text)
+                    if m.session_id:
+                        new_session_id = m.session_id
+                elif isinstance(m, ResultMessage):
+                    if m.session_id:
+                        new_session_id = m.session_id
+                    if m.is_error and m.errors:
+                        err = "; ".join(m.errors)
+            session.last_used = datetime.now(timezone.utc)
     except Exception as e:
         log.exception("agent query failed for user=%s", user.id)
         err = f"agent 错误:{type(e).__name__}: {e}"
+        # 出错 → 关 client,下次重新 connect
+        await _close_client_session(user.id)
 
     if new_session_id:
         _chat_sessions[user.id] = new_session_id
@@ -1052,7 +1132,25 @@ def main() -> None:
         log.warning("(QR 生成失败 — 直接复制 secret 输入 app: %s)", e)
     log.warning("=== END TOTP setup ===")
 
-    app = Application.builder().token(token).build()
+    async def _post_init(app_):
+        # 启动 background cleanup loop(每分钟扫 idle ClaudeSDKClient,30 min 无活动 → 关)
+        app_.bot_data["idle_cleanup_task"] = asyncio.create_task(_client_idle_cleanup_loop())
+
+    async def _post_shutdown(app_):
+        # 关所有 active ClaudeSDKClient + 取消 cleanup task
+        task = app_.bot_data.get("idle_cleanup_task")
+        if task:
+            task.cancel()
+        for uid in list(_client_sessions.keys()):
+            await _close_client_session(uid)
+
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("reset", cmd_reset))
