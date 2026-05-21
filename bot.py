@@ -54,7 +54,7 @@ from telegram.ext import (
     filters,
 )
 
-from classifier import LLMRouter, Verdict
+from classifier import ClaudeCodeCLI, LLMRouter, Verdict
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -75,11 +75,12 @@ GROUP_CHAT_ID = (
 NOTIFY_ADMIN_ID = next(iter(ADMIN_USER_IDS), None)  # DM 第一个管理员
 
 # LLM provider 路由 —
-#   - 显式 LLM_PROVIDER=claude / openai → 单 provider,无 fallback
-#   - 未显式设(默认):双 key 都配 → openai primary(便宜,DeepSeek 等)+ claude fallback
-#                      只 openai key   → openai 单(无 fallback)
-#                      只 claude key   → claude 单(无 fallback)
-#                      都没           → SystemExit
+#   - 显式 LLM_PROVIDER=claude / openai / claude-cli → 单 provider 无 fallback
+#   - 未显式设(默认,推荐):
+#       OPENAI_API_KEY 配了    → openai primary(DeepSeek 等)
+#       ANTHROPIC_API_KEY 配了 → 加 Claude API 作 fallback
+#       默认始终再加 Claude Code CLI 作最后兜底(OAuth 包月,API limit hit 也能用)
+#   - 顺序:DeepSeek → Claude API → Claude CLI
 def _make_claude() -> AsyncAnthropic:
     return AsyncAnthropic()  # 自动读 ANTHROPIC_API_KEY
 
@@ -103,18 +104,22 @@ elif _LLM_PROVIDER == "openai":
     if not _has_openai:
         raise SystemExit("OPENAI_API_KEY missing(LLM_PROVIDER=openai)")
     llm_router = LLMRouter(_make_openai(), fallback=None)
+elif _LLM_PROVIDER == "claude-cli":
+    # 强制只用 CLI 包月,任何分类都走 claude-agent-sdk OAuth
+    llm_router = LLMRouter(ClaudeCodeCLI(), fallback=None)
 elif _LLM_PROVIDER == "":
-    # 自动 — 双 key → openai 主 / claude 备;单 key → 单 provider
-    if _has_openai and _has_anthropic:
-        llm_router = LLMRouter(_make_openai(), fallback=_make_claude())
-    elif _has_openai:
-        llm_router = LLMRouter(_make_openai(), fallback=None)
+    # 自动 — primary openai(快/便宜),fallback Claude CLI(包月,不算 API spend)
+    # API key 路径默认不上 LLMRouter(API limit 一旦 hit 反而拖慢)
+    if _has_openai:
+        llm_router = LLMRouter(_make_openai(), fallback=ClaudeCodeCLI())
     elif _has_anthropic:
-        llm_router = LLMRouter(_make_claude(), fallback=None)
+        # 没 OpenAI key,只能用 API(走 monthly limit),仍加 CLI 作兜底
+        llm_router = LLMRouter(_make_claude(), fallback=ClaudeCodeCLI())
     else:
-        raise SystemExit("需 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 至少一个")
+        # 啥 key 都没,只剩 CLI 包月
+        llm_router = LLMRouter(ClaudeCodeCLI(), fallback=None)
 else:
-    raise SystemExit(f"unknown LLM_PROVIDER={_LLM_PROVIDER!r},需 claude / openai / 空")
+    raise SystemExit(f"unknown LLM_PROVIDER={_LLM_PROVIDER!r},需 claude / openai / claude-cli / 空")
 
 # 累犯升级:同一 user 2 小时内被自动删 ≥ 2 次,直接 ban
 RECIDIVIST_WINDOW = timedelta(hours=2)

@@ -16,7 +16,16 @@ from openai import AsyncOpenAI
 
 log = logging.getLogger("classifier")
 
-LLMClient = Union[AsyncAnthropic, AsyncOpenAI]
+
+class ClaudeCodeCLI:
+    """LLMRouter fallback sentinel — 走 claude-agent-sdk spawn CLI(OAuth 包月)
+    而非 anthropic SDK API token。API hit monthly spending limit 时仍可用。"""
+
+    def __repr__(self) -> str:
+        return "ClaudeCodeCLI()"
+
+
+LLMClient = Union[AsyncAnthropic, AsyncOpenAI, ClaudeCodeCLI]
 
 Action = Literal["delete_ban", "delete_mute", "delete", "flag", "ignore"]
 Category = Literal[
@@ -307,10 +316,52 @@ async def _classify_openai(
 
 def _client_label(client: LLMClient) -> str:
     if isinstance(client, AsyncAnthropic):
-        return "claude"
+        return "claude-api"
     if isinstance(client, AsyncOpenAI):
         return "openai"
+    if isinstance(client, ClaudeCodeCLI):
+        return "claude-cli"
     return "unknown"
+
+
+async def _classify_claude_cli(user_block: str) -> Verdict:
+    """走 claude-agent-sdk spawn CLI(OAuth 订阅,不算 API spend)。
+    一轮 reply 无 tools — system_prompt 含 JSON schema,Claude 直接输出 JSON。
+    """
+    # 延迟 import 避免主进程加载 SDK 时不必要的 overhead
+    from claude_agent_sdk import (
+        query as cli_query,
+        ClaudeAgentOptions,
+        AssistantMessage as CLIAssistantMessage,
+        ResultMessage as CLIResultMessage,
+        TextBlock as CLITextBlock,
+    )
+
+    options = ClaudeAgentOptions(
+        system_prompt=SYSTEM_PROMPT,
+        permission_mode="bypassPermissions",
+        max_turns=1,
+        disallowed_tools=[
+            "Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit",
+            "Grep", "Glob", "WebFetch", "WebSearch",
+            "TodoWrite", "Task", "BashOutput", "KillShell", "SlashCommand",
+        ],
+        # 关键:屏蔽继承的 ANTHROPIC_API_KEY → CLI fall back OAuth 订阅(包月)
+        env={"ANTHROPIC_API_KEY": ""},
+    )
+
+    collected: list[str] = []
+    async for m in cli_query(prompt=user_block, options=options):
+        if isinstance(m, CLIAssistantMessage):
+            for block in m.content:
+                if isinstance(block, CLITextBlock) and block.text:
+                    collected.append(block.text)
+        elif isinstance(m, CLIResultMessage) and m.result:
+            collected.append(m.result)
+
+    text_out = "\n".join(collected).strip()
+    log.info("claude-cli classifier out_len=%d", len(text_out))
+    return _parse_verdict(text_out)
 
 
 async def _classify_one(client: LLMClient, user_block: str) -> Verdict:
@@ -321,6 +372,8 @@ async def _classify_one(client: LLMClient, user_block: str) -> Verdict:
         # DeepSeek 默认 deepseek-chat;OpenAI 走时改 gpt-4o-mini 之类(by env)
         model = os.environ.get("OPENAI_MODEL", "deepseek-chat")
         return await _classify_openai(client, user_block, model)
+    if isinstance(client, ClaudeCodeCLI):
+        return await _classify_claude_cli(user_block)
     raise TypeError(f"unsupported LLM client type: {type(client).__name__}")
 
 
