@@ -15,6 +15,19 @@ sudo systemctl enable --now telegram-bot
 
 `DRY_RUN=true` 只打日志不真删真踢。
 
+## 更新
+
+代码改完 push GitHub 后,机器上一行:
+
+```bash
+/home/botuser/telegram-bot/update.sh
+```
+
+= `git pull --ff-only` + `.venv/bin/pip install -r requirements.txt` + `sudo systemctl restart telegram-bot` + 显前 5 行 status。
+
+改了 `telegram-bot.service` 文件本身需要额外:`sudo cp telegram-bot.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart telegram-bot`。
+改了 `.env` 不走 git,直接编辑后 `sudo systemctl restart telegram-bot`。
+
 ## 运行情况
 
 `sudo systemctl status telegram-bot` / `journalctl -u telegram-bot -f`
