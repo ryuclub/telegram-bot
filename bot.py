@@ -232,6 +232,8 @@ def _log_verdict(update: Update, verdict: Verdict) -> None:
         "user_is_bot": user.is_bot if user else None,
         "message_id": msg.message_id if msg else None,
         "text": msg.text if msg else None,
+        "caption": msg.caption if msg else None,
+        "enriched_text": _extract_classify_text(msg) if msg else None,
         "forwarded": bool(msg.forward_origin) if msg else False,
         "verdict": {
             "is_spam": verdict.is_spam,
@@ -1089,9 +1091,55 @@ async def on_verify_click(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     log.info("verify: passed user=%s", target_uid)
 
 
+def _extract_classify_text(msg) -> str:
+    """拼丰富 context 给 classifier — 防"i" 单字符广告漏检:
+    text/caption + entities 里的 URL + link_preview URL + 转发来源。
+    """
+    parts: list[str] = []
+    base = (msg.text or msg.caption or "").strip()
+    if base:
+        parts.append(base)
+
+    # 提 URL:text_link entity(显示文字 vs 实际 URL 不同的)+ url entity 在 text 已含
+    extra_urls: list[str] = []
+    for ent in list(msg.entities or []) + list(msg.caption_entities or []):
+        if ent.type == "text_link" and ent.url:
+            extra_urls.append(ent.url)
+    # link preview 也给(广告常见:文字 "i" + 链接预览 t.me/...)
+    if getattr(msg, "link_preview_options", None) and getattr(msg.link_preview_options, "url", None):
+        extra_urls.append(msg.link_preview_options.url)
+    if extra_urls:
+        parts.append("[包含链接] " + " ".join(extra_urls))
+
+    # 转发来源 — channel/user 名 是判 spam 的强信号
+    if msg.forward_origin:
+        try:
+            origin = msg.forward_origin
+            origin_name = type(origin).__name__
+            if hasattr(origin, "chat") and origin.chat:
+                origin_name = f"频道 @{origin.chat.username or origin.chat.title or '?'}"
+            elif hasattr(origin, "sender_user") and origin.sender_user:
+                origin_name = f"用户 @{origin.sender_user.username or origin.sender_user.full_name or '?'}"
+            elif hasattr(origin, "sender_user_name"):
+                origin_name = f"隐藏用户 {origin.sender_user_name}"
+            parts.append(f"[转发自 {origin_name}]")
+        except Exception:
+            parts.append("[转发]")
+
+    return "\n".join(parts) if parts else (msg.text or msg.caption or "")
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if msg is None or not msg.text:
+    if msg is None:
+        return
+    # 至少要 text/caption/forward/含 URL 之一才送审(纯媒体 / 纯反应不审)
+    has_content = bool(
+        msg.text or msg.caption
+        or msg.forward_origin
+        or msg.entities or msg.caption_entities
+    )
+    if not has_content:
         return
     chat = update.effective_chat
     user = msg.from_user
@@ -1113,18 +1161,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if user:
         _record_user_message(user.id, msg.message_id, msg.date or datetime.now(timezone.utc))
 
+    enriched_text = _extract_classify_text(msg)
     log.info(
         "[%s/%s] %s(@%s): %s",
         chat.type,
         chat.id,
         user.full_name if user else "?",
         user.username if user else "?",
-        msg.text[:200],
+        enriched_text[:200],
     )
 
     try:
         verdict = await llm_router.classify(
-            text=msg.text,
+            text=enriched_text,
             sender_name=user.full_name if user else "?",
             sender_username=user.username if user else None,
             has_link=_has_link(msg),
