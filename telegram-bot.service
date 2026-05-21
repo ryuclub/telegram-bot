@@ -20,7 +20,9 @@ SyslogIdentifier=telegram-bot
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/home/botuser/telegram-bot
+# Claude Agent SDK spawn bundled `claude` CLI 需要写 ~/.claude(sessions / settings / statsig)。
+# ProtectHome=read-only 时 bundled CLI exit 1 — 放开 .claude + bot 自己工作目录。
+ReadWritePaths=/home/botuser/telegram-bot /home/botuser/.claude
 ProtectHome=read-only
 
 [Install]
