@@ -308,6 +308,60 @@ _totp_fails: dict[int, tuple[int, datetime | None]] = {}
 # Chat model 选择(per user_id);None = SDK 默认(跟 Claude Code 配置)
 _user_chat_model: dict[int, str] = {}
 
+
+# === Session 状态持久化(bot 重启不丢 auth / 对话 / 模型选择) ===
+_STATE_FILE = Path(__file__).parent / ".session-state.json"
+
+
+def _load_state() -> None:
+    """启动时调一次。文件不存在 / 损坏 → 静默从空开始。"""
+    if not _STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(_STATE_FILE.read_text())
+        for uid_s, iso in (data.get("auth_sessions") or {}).items():
+            _auth_sessions[int(uid_s)] = datetime.fromisoformat(iso)
+        for uid_s, sid in (data.get("chat_sessions") or {}).items():
+            _chat_sessions[int(uid_s)] = sid
+        for uid_s, model in (data.get("user_chat_model") or {}).items():
+            _user_chat_model[int(uid_s)] = model
+        for uid_s, item in (data.get("totp_fails") or {}).items():
+            count, lock_iso = item
+            _totp_fails[int(uid_s)] = (
+                count,
+                datetime.fromisoformat(lock_iso) if lock_iso else None,
+            )
+        log.info(
+            "session state loaded: auth=%d chat=%d model=%d",
+            len(_auth_sessions), len(_chat_sessions), len(_user_chat_model),
+        )
+    except Exception as e:
+        log.warning("session state load failed (ignored, fresh start): %s", e)
+
+
+def _save_state() -> None:
+    """状态变更后调。简单同步 write,文件几 KB 无 perf 问题。"""
+    try:
+        data = {
+            "auth_sessions": {str(k): v.isoformat() for k, v in _auth_sessions.items()},
+            "chat_sessions": {str(k): v for k, v in _chat_sessions.items()},
+            "user_chat_model": {str(k): v for k, v in _user_chat_model.items()},
+            "totp_fails": {
+                str(k): [c, (lu.isoformat() if lu else None)]
+                for k, (c, lu) in _totp_fails.items()
+            },
+        }
+        # 原子写:tmp + rename(防止 crash 时 partial file)
+        tmp = _STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        tmp.chmod(0o600)
+        tmp.replace(_STATE_FILE)
+    except Exception as e:
+        log.warning("session state save failed: %s", e)
+
+
+_load_state()
+
 # 预设可选 model 列表(`/model` 列出 + key 短输入)
 _CHAT_MODEL_PRESETS = {
     "opus": "claude-opus-4-7",
@@ -326,6 +380,7 @@ def _is_authed(user_id: int) -> bool:
 def _touch_session(user_id: int) -> None:
     """活跃 → 重置 last_active(续期 24h)"""
     _auth_sessions[user_id] = datetime.now(timezone.utc)
+    _save_state()
 
 _AGENT_SYSTEM_PROMPT = """\
 你是 telegram 群管理 bot 内嵌的助手,通过私聊跟管理员(botuser)交互。
@@ -340,6 +395,8 @@ async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("权限不足。")
         return
     had = _chat_sessions.pop(user.id, None)
+    if had:
+        _save_state()
     txt = "✅ 会话已清,下条消息开新对话。" if had else "(本来就没活跃会话)"
     await update.effective_message.reply_text(txt)
 
@@ -378,6 +435,7 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if totp.verify(code, valid_window=1):  # ±30s 容忍时钟漂移
         _touch_session(user.id)
         _totp_fails.pop(user.id, None)
+        _save_state()
         await context.bot.send_message(
             user.id,
             f"✅ 验证通过。24h session 已开,每次发消息自动续 24h。\n`/logout` 主动结束。",
@@ -389,6 +447,7 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     fails += 1
     if fails >= _TOTP_LOCK_MAX_FAILS:
         _totp_fails[user.id] = (0, now + _TOTP_LOCK_DURATION)
+        _save_state()
         await context.bot.send_message(
             user.id,
             f"❌ 验证失败 {fails} 次,锁定 15 分钟。",
@@ -396,6 +455,7 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("totp lock user=%s", user.id)
     else:
         _totp_fails[user.id] = (fails, None)
+        _save_state()
         await context.bot.send_message(
             user.id,
             f"❌ 验证失败({fails}/{_TOTP_LOCK_MAX_FAILS})。",
@@ -410,6 +470,7 @@ async def cmd_logout(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     had = _auth_sessions.pop(user.id, None)
     _chat_sessions.pop(user.id, None)  # 顺便清 claude session
+    _save_state()
     txt = "✅ 已 logout,session + 对话历史已清。" if had else "(本来就没 session)"
     await msg.reply_text(txt)
 
@@ -438,11 +499,13 @@ async def cmd_model(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     arg = parts[1].strip()
     if arg == "reset" or arg == "default":
         _user_chat_model.pop(user.id, None)
+        _save_state()
         await msg.reply_text("✅ 已恢复默认 model。")
         return
 
     target = _CHAT_MODEL_PRESETS.get(arg, arg)  # 预设 key 或直接 full name
     _user_chat_model[user.id] = target
+    _save_state()
     await msg.reply_text(f"✅ chat model 切为 `{target}`。", parse_mode="Markdown")
 
 
@@ -516,6 +579,7 @@ async def on_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if new_session_id:
         _chat_sessions[user.id] = new_session_id
+        _save_state()
 
     response = "\n".join(s for s in collected if s).strip()
     if err and not response:
