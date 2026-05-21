@@ -1,16 +1,22 @@
-"""Claude 驱动的消息分类器 — 移民讨论群语境。"""
+"""LLM 驱动的消息分类器 — 移民讨论群语境。
+支持 Claude(Anthropic 原生 SDK)+ OpenAI 兼容(DeepSeek / OpenAI / 其它兼容 endpoint)。
+切换:LLM_PROVIDER=claude | openai。"""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Union
 
 from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 
 log = logging.getLogger("classifier")
+
+LLMClient = Union[AsyncAnthropic, AsyncOpenAI]
 
 Action = Literal["delete_ban", "delete_mute", "delete", "flag", "ignore"]
 Category = Literal[
@@ -232,16 +238,11 @@ def _parse_verdict(raw: str) -> Verdict:
     )
 
 
-async def classify(
-    client: AsyncAnthropic,
-    *,
-    text: str,
-    sender_name: str,
-    sender_username: str | None,
-    has_link: bool,
-    is_forwarded: bool,
-) -> Verdict:
-    user_block = (
+def _build_user_block(
+    *, text: str, sender_name: str, sender_username: str | None,
+    has_link: bool, is_forwarded: bool,
+) -> str:
+    return (
         f"发送人显示名:{sender_name}\n"
         f"用户名:@{sender_username or '无'}\n"
         f"包含链接:{'是' if has_link else '否'}\n"
@@ -250,8 +251,12 @@ async def classify(
         "请按 schema 输出 JSON。"
     )
 
+
+async def _classify_claude(
+    client: AsyncAnthropic, user_block: str, model: str,
+) -> Verdict:
     resp = await client.messages.create(
-        model="claude-haiku-4-5",
+        model=model,
         max_tokens=256,
         system=[
             {
@@ -262,17 +267,62 @@ async def classify(
         ],
         messages=[{"role": "user", "content": user_block}],
     )
-
-    text_out = next(
-        (b.text for b in resp.content if b.type == "text"), ""
-    )
-
+    text_out = next((b.text for b in resp.content if b.type == "text"), "")
     log.info(
-        "tokens in=%d cached_read=%d cached_write=%d out=%d",
+        "claude tokens in=%d cached_read=%d cached_write=%d out=%d",
         resp.usage.input_tokens,
         resp.usage.cache_read_input_tokens or 0,
         resp.usage.cache_creation_input_tokens or 0,
         resp.usage.output_tokens,
     )
-
     return _parse_verdict(text_out)
+
+
+async def _classify_openai(
+    client: AsyncOpenAI, user_block: str, model: str,
+) -> Verdict:
+    # OpenAI-compatible(DeepSeek 等)— 用 chat.completions.create + json_object 强制 JSON 输出。
+    # 无 prompt caching API,system prompt 每次重传(DeepSeek 服务端有自动 cache,实际省略大部分 in token)。
+    resp = await client.chat.completions.create(
+        model=model,
+        max_tokens=256,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_block},
+        ],
+    )
+    text_out = resp.choices[0].message.content or ""
+    usage = resp.usage
+    # DeepSeek 用 prompt_cache_hit_tokens / prompt_cache_miss_tokens 扩展字段;OpenAI 原生没。
+    cache_hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+    cache_miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+    log.info(
+        "openai tokens in=%d cache_hit=%d cache_miss=%d out=%d model=%s",
+        usage.prompt_tokens, cache_hit, cache_miss,
+        usage.completion_tokens, model,
+    )
+    return _parse_verdict(text_out)
+
+
+async def classify(
+    client: LLMClient,
+    *,
+    text: str,
+    sender_name: str,
+    sender_username: str | None,
+    has_link: bool,
+    is_forwarded: bool,
+) -> Verdict:
+    user_block = _build_user_block(
+        text=text, sender_name=sender_name, sender_username=sender_username,
+        has_link=has_link, is_forwarded=is_forwarded,
+    )
+    if isinstance(client, AsyncAnthropic):
+        model = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
+        return await _classify_claude(client, user_block, model)
+    if isinstance(client, AsyncOpenAI):
+        # DeepSeek 默认 deepseek-chat;OpenAI 走时改 gpt-4o-mini 之类(by env)
+        model = os.environ.get("OPENAI_MODEL", "deepseek-chat")
+        return await _classify_openai(client, user_block, model)
+    raise TypeError(f"unsupported LLM client type: {type(client).__name__}")

@@ -24,6 +24,7 @@ from pathlib import Path
 import httpx
 
 from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from telegram import (
     ChatMemberUpdated,
@@ -65,7 +66,19 @@ GROUP_CHAT_ID = (
 )
 NOTIFY_ADMIN_ID = next(iter(ADMIN_USER_IDS), None)  # DM 第一个管理员
 
-claude = AsyncAnthropic()  # 自动读 ANTHROPIC_API_KEY
+# LLM provider 选择 — `claude`(默认,Anthropic 原生 + prompt caching)/ `openai`(OpenAI 兼容,
+# 含 DeepSeek。配 OPENAI_API_KEY + OPENAI_BASE_URL + OPENAI_MODEL,DeepSeek 时 base_url=
+# https://api.deepseek.com/v1,model=deepseek-chat / deepseek-reasoner)。
+_LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "claude").lower()
+if _LLM_PROVIDER == "claude":
+    llm_client = AsyncAnthropic()  # 自动读 ANTHROPIC_API_KEY
+elif _LLM_PROVIDER == "openai":
+    llm_client = AsyncOpenAI(
+        api_key=os.environ["OPENAI_API_KEY"],
+        base_url=os.environ.get("OPENAI_BASE_URL") or None,  # 空 → openai.com 官方
+    )
+else:
+    raise SystemExit(f"unknown LLM_PROVIDER={_LLM_PROVIDER!r},需 claude 或 openai")
 
 # 累犯升级:同一 user 2 小时内被自动删 ≥ 2 次,直接 ban
 RECIDIVIST_WINDOW = timedelta(hours=2)
@@ -550,7 +563,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     try:
         verdict = await classify(
-            claude,
+            llm_client,
             text=msg.text,
             sender_name=user.full_name if user else "?",
             sender_username=user.username if user else None,
@@ -572,8 +585,10 @@ def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN missing in .env")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise SystemExit("ANTHROPIC_API_KEY missing in .env")
+    if _LLM_PROVIDER == "claude" and not os.environ.get("ANTHROPIC_API_KEY"):
+        raise SystemExit("ANTHROPIC_API_KEY missing in .env(LLM_PROVIDER=claude)")
+    if _LLM_PROVIDER == "openai" and not os.environ.get("OPENAI_API_KEY"):
+        raise SystemExit("OPENAI_API_KEY missing in .env(LLM_PROVIDER=openai)")
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("ping", cmd_ping))
