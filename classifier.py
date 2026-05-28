@@ -124,6 +124,19 @@ SYSTEM_PROMPT = """\
 - "招接码 接验证码 一单几十" → dirty_money, 0.85+, delete_mute
 - "走支付通道 千分之X" → dirty_money, 0.80+, delete_mute
 
+## 黑话/谐音变体(spammer 拆字、谐音、错别字绕过关键词)— 务必识别
+关键观察:广告主常用「米→钱、出→sell、收→buy、哦/喔/噢/o→哦、接→介、剪接/介接→接单、看哦/看喔→看哦」拼接拗口短句。
+正常人不会发"米/喔/剪接/介接"这种字符串。短句(4-15 字)+ 含 "米/喔/哦/出/收/接/付/打/介/资/U" 多个组合 → 极可能黑话。
+- "转米看喔剪接" → dirty_money, 0.85+, delete_mute(转米=转账,看喔=看哦,剪接=接单)
+- "出米 收米 长期" → dirty_money 或 crypto_otc, 0.90+, delete_ban
+- "打米 介接 看哦" → dirty_money, 0.85+, delete_mute
+- "打U 收U 出U 看哦" → crypto_otc, 0.90+, delete_ban
+- "代打 米单 高价" → dirty_money, 0.85+, delete_mute
+- "出口 收口 包接" → dirty_money 或 fake_docs, 0.80+, delete_mute(口=出入金口子)
+- 短句出现「米/U」+「出/收/打/接」+「看/聊/介」组合 → 至少 flag, 0.6+
+- 注意误判:"我去吃米线"、"米其林"、"美剧剪接"=not_spam(完整语境)
+  判别要点:看是否拗口、无完整语意、缺主谓宾。正常对话会有上下文,黑话只有"动作+载体+招呼"三件套。
+
 ## USDT/虚拟币 OTC 揽客 (crypto_otc)
 - "出U 收U 汇率好 长期" → crypto_otc, 0.90+, delete_ban
 - "u商接单 量大优先" → crypto_otc, 0.85+, delete_mute
