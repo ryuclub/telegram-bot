@@ -577,7 +577,7 @@ async def _get_or_create_client_session(user_id: int) -> _ClientSession:
         permission_mode="bypassPermissions",
         resume=_chat_sessions.get(user_id),  # 上次的 claude session_id;None = 新对话
         max_turns=50,
-        max_budget_usd=5.0,
+        max_budget_usd=20.0,
         model=_user_chat_model.get(user_id),
         # 关键:.env 里的 ANTHROPIC_API_KEY 让 CLI 走 API 计费(用户的 monthly spend limit)。
         # 清空让 CLI fall back 到 Claude Code OAuth 订阅(包月,不计 token)。
