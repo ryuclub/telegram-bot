@@ -137,6 +137,55 @@ SYSTEM_PROMPT = """\
 
 # 训练样本(few-shot 参考,仅供学习,不要在你的输出里引用)
 
+## "官方认证 / 官方推荐 / 内部资源" + 短代号(impersonation 或 other_spam)
+极短消息("官方认证 EQaZ"、"官方推荐 V8R"、"内部资源 ABCD")— 单独无上下文,但**几乎 100% 是引流暗号**:
+- 真"官方"绝不会只发 4 字 + 一段随机字母代号
+- 短代号(3-5 位字母数字)= 项目名/邀请码/推荐码
+- 配合可疑 username(随机字符串 8-15 位)+ 装饰性 emoji 显示名(❀✨💖) → 几乎必是机器人推广
+- 判 impersonation(冒充官方)或 other_spam, 0.85+, delete_ban
+- 反例:"加拿大移民官方频道更新" 完整句子 → not_spam(讨论)
+
+## 可疑 username 模式(metadata 加分项,非独立类别)
+看 user_username 字段:
+- 随机字符串 8+ 位无意义(`o6aq9ciyp4eds`、`xj2k9mfp`、`bot8821xyz`)→ +0.1 confidence
+- 显示名带多个装饰 emoji(❀✨💖🌸💕)+ 短"官方"/"福利"/"代查"类词 → +0.1 confidence
+- @None(无 username)+ 数字结尾 user_name + 引流话术 → +0.05
+- 单独可疑名 ≠ 违规,但跟模糊推广话术叠加 → 翻面阈值
+
+## display name 广告(本人发"1"/"w"/emoji 占位,广告写在 sender_name 显示名里)
+**重要漏判模式**:spammer 把广告/黑话/联系方式塞进 display name(`发送人显示名:` 字段),自己只发无意义字符。**必须把 display name 当作 spam 信号**,等同于消息正文。
+判别要点:看 `发送人显示名:` 里有没有下列特征:
+- 灰产/赌博/性服务/招代理黑话:"带上岸/不忘本/带几个/带飞/老司机/出U/收U/接验证码/福利/代办/认证"
+- 联系方式:"@用户名"、"vx/微信"、"TG/Telegram"、电话号
+- 推广暗号:"BC/沙巴/皇冠/AG/真人/百家乐/体育"
+- 多个装饰 emoji(🤖💍🖤🎸✨🌸💕)+ 短促招呼词 — 典型 spam 包装
+
+举例:
+- 显示名"🤖带几个上岸💍 🖤不忘本的来🎸" + 本人发"1" → mass_dm_solicit 或 gambling, 0.95+, delete_ban(display name 即广告)
+- 显示名"出U收U长期 加TG @xxx" + 本人发任何 → crypto_otc, 0.95+, delete_ban
+- 显示名"代办护照签证 VX abc123" → fake_docs 或 agent_promo, 0.95+, delete_ban
+- 反例:正常显示名 "Tanaka Ryu" / "张三" / 单 emoji "🐱" → 不算
+- 反例:显示名 emoji 多但无黑话(如 "✨小可爱✨") → 不算单独触发,但可叠加其他信号
+
+**重要**:display name 命中黑话 = 100% spam,不需要正文配合。
+
+## quote-bait / reply-bait(用 quote 挂广告,本人发单字)— 必须看 quote 内容判
+**重要漏判模式**:spammer 自己只发 "w" / "1" / "?" / "i" / 单 emoji,但用 reply quote 一段引流文字(显示在客户端,管理员看得清),或 external_reply 引用外部广告频道。
+判别要点:**enriched_text 含 `[引用文本] ...` 或 `[引用自外部频道 @xxx]` 时,判断时把引用文字当作"本人发的"来判**。本人正文是不是单字无所谓 — 看 quote 是不是广告。
+- 本人发"w" + [引用文本] "操逼赚钱，妈呀多好的事" → dirty_money 或 mass_dm_solicit, 0.95+, delete_ban
+- 本人发"?" + [引用自外部频道 @uintfrruiiknn] → channel_promo(引流陌生频道), 0.85+, delete_ban
+- 本人发单字 + quote 任何招代理 / 联系方式 / 价目 → 按 quote 内容定 category, delete_ban
+- 反例:本人完整回复 "我也觉得 [引用] 法国签证最近紧" → not_spam(正常 reply 引用)
+
+## 电脑挂机灰产 / "用电脑挣钱"招小弟(dirty_money 或 other_spam)
+"用电脑/算力/带宽挣钱"几乎都是:跑分代理 / 挂机点击农场 / 黑产代理 IP / 闲置算力挖矿招代理。模糊语义+招代理特征=至少 delete_mute。
+- "你的电脑还在闲着么 来用它挣钱" → other_spam(或 dirty_money), 0.85+, delete_mute
+- "招小弟 有电脑的来" → dirty_money(招代理), 0.85+, delete_mute
+- "电脑闲置变现 加我" → other_spam, 0.85+, delete_mute
+- "在家用电脑日入 X 百" → other_spam 或 job_lure, 0.85+, delete_mute
+- "招学徒/招小弟/带你做" + 无具体内容 + 私聊导向 → 0.80+, delete_mute(典型先洗清白后发广告)
+- 反例:"我电脑配置太老,想换"=not_spam(讨论硬件无揽客)
+
 ## 跑分/洗钱 (dirty_money)
 - "ZFB 微信 收米付米 一天 X 千" → dirty_money, 0.95+, delete_ban(收米付米=跑分黑话)
 - "小额洗资真稳几分钟几百" → dirty_money, 0.95+, delete_ban(洗资=洗钱)
@@ -296,14 +345,36 @@ SYSTEM_PROMPT = """\
 - 信不过就 flag,不要硬删。用户被误删一次的伤害远大于多一条广告漏掉的伤害"""
 
 
-_JSON_RE = re.compile(r"\{[\s\S]*\}")
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _first_json_object(raw: str) -> dict | None:
+    """取文本中第一个能解析成功的 JSON 对象。
+
+    比贪婪正则 `\\{[\\s\\S]*\\}` 稳:模型有时会重复输出同一个对象(CLI 会把
+    assistant 文本块和 result 各回一份 → 两份相同 JSON 叠成 `{..}\\n{..}`),
+    或在 JSON 前后带解释性文字。贪婪匹配会从第一个 { 吃到最后一个 } 导致
+    "Extra data" 解析失败。这里用 raw_decode 逐个 { 试,拿到首个合法对象即返回。
+    """
+    idx = 0
+    while True:
+        start = raw.find("{", idx)
+        if start == -1:
+            return None
+        try:
+            obj, _ = _JSON_DECODER.raw_decode(raw, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        if isinstance(obj, dict):
+            return obj
+        idx = start + 1
 
 
 def _parse_verdict(raw: str) -> Verdict:
-    m = _JSON_RE.search(raw)
-    if not m:
+    data = _first_json_object(raw)
+    if data is None:
         raise ValueError(f"no JSON object in response: {raw[:200]}")
-    data = json.loads(m.group(0))
     return Verdict(
         is_spam=bool(data["is_spam"]),
         category=data["category"],
