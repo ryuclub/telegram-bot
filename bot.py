@@ -77,7 +77,8 @@ GROUP_CHAT_ID = (
 NOTIFY_ADMIN_ID = next(iter(ADMIN_USER_IDS), None)  # DM 第一个管理员
 
 # LLM provider 路由 —
-#   - 显式 LLM_PROVIDER=claude / openai / claude-cli → 单 provider 无 fallback
+#   - 显式 LLM_PROVIDER=claude / openai → 单 provider 无 fallback
+#   - 显式 LLM_PROVIDER=claude-cli → Claude CLI 主力,有 OpenAI key 则 DeepSeek 兜底
 #   - 未显式设(默认,推荐):
 #       OPENAI_API_KEY 配了    → openai primary(DeepSeek 等)
 #       ANTHROPIC_API_KEY 配了 → 加 Claude API 作 fallback
@@ -107,8 +108,9 @@ elif _LLM_PROVIDER == "openai":
         raise SystemExit("OPENAI_API_KEY missing(LLM_PROVIDER=openai)")
     llm_router = LLMRouter(_make_openai(), fallback=None)
 elif _LLM_PROVIDER == "claude-cli":
-    # 强制只用 CLI 包月,任何分类都走 claude-agent-sdk OAuth
-    llm_router = LLMRouter(ClaudeCodeCLI(), fallback=None)
+    # Claude CLI 主力(OAuth 包月,不算 API spend)。有 OpenAI key → 挂它作兜底,
+    # CLI 抽风(如版本不匹配)时自动降级到 DeepSeek,不整体失效;没 key 则纯 CLI。
+    llm_router = LLMRouter(ClaudeCodeCLI(), fallback=_make_openai() if _has_openai else None)
 elif _LLM_PROVIDER == "":
     # 自动 — primary openai(快/便宜),fallback Claude CLI(包月,不算 API spend)
     # API key 路径默认不上 LLMRouter(API limit 一旦 hit 反而拖慢)
@@ -507,7 +509,7 @@ _load_state()
 
 # 预设可选 model 列表(`/model` 列出 + key 短输入)
 _CHAT_MODEL_PRESETS = {
-    "opus": "claude-opus-4-7",
+    "opus": "claude-opus-4-8",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
 }
@@ -521,9 +523,18 @@ def _is_authed(user_id: int) -> bool:
 
 
 def _touch_session(user_id: int) -> None:
-    """活跃 → 重置 last_active(续期 72h)"""
+    """活跃 → 重置 last_active(续期到 rules.SESSION_DURATION)"""
     _auth_sessions[user_id] = datetime.now(timezone.utc)
     _save_state()
+
+
+def _session_dur_label() -> str:
+    """动态读 rules.SESSION_DURATION 生成人类可读时长(改配置文案自动跟着变)。"""
+    d = rules.SESSION_DURATION
+    days = d.days
+    if days >= 1:
+        return f"{days} 天"
+    return f"{int(d.total_seconds() // 3600)}h"
 
 _AGENT_SYSTEM_PROMPT = """\
 你是 telegram 群管理 bot 内嵌的助手,通过私聊跟管理员(botuser)交互。
@@ -572,20 +583,35 @@ async def _get_or_create_client_session(user_id: int) -> _ClientSession:
     if s is not None:
         s.last_used = datetime.now(timezone.utc)
         return s
-    options = ClaudeAgentOptions(
-        system_prompt=_AGENT_SYSTEM_PROMPT,
-        permission_mode="bypassPermissions",
-        resume=_chat_sessions.get(user_id),  # 上次的 claude session_id;None = 新对话
-        max_turns=50,
-        max_budget_usd=20.0,
-        model=_user_chat_model.get(user_id),
-        # 关键:.env 里的 ANTHROPIC_API_KEY 让 CLI 走 API 计费(用户的 monthly spend limit)。
-        # 清空让 CLI fall back 到 Claude Code OAuth 订阅(包月,不计 token)。
-        # classifier 那条路在主进程内调 anthropic SDK,仍能用 env 里的 API key 作 fallback。
-        env={"ANTHROPIC_API_KEY": ""},
-    )
-    s = _ClientSession(options)
-    await s.ensure_connected()
+    def _build(resume: str | None) -> ClaudeAgentOptions:
+        return ClaudeAgentOptions(
+            system_prompt=_AGENT_SYSTEM_PROMPT,
+            permission_mode="bypassPermissions",
+            resume=resume,  # 上次的 claude session_id;None = 新对话
+            max_turns=50,
+            max_budget_usd=20.0,
+            model=_user_chat_model.get(user_id),
+            # 不写死 cli 路径 —— 让 SDK 自己发现(优先 bundled,跟 SDK 版本对齐,最稳)。
+            # 之前写死 /home/carlos/.local/bin/claude(别人机器的路径)→ 本机 CLINotFoundError。
+            # 关键:清空 ANTHROPIC_API_KEY 让 CLI 走 OAuth(env 里的 CLAUDE_CODE_OAUTH_TOKEN,
+            # 守护进程读不到登录钥匙串,靠这个 token 认证),不计 API token 费。
+            env={"ANTHROPIC_API_KEY": ""},
+        )
+
+    resume = _chat_sessions.get(user_id)
+    s = _ClientSession(_build(resume))
+    try:
+        await s.ensure_connected()
+    except Exception as e:
+        # resume 的 session_id 失效(claude 报 "No conversation found") → exit 1。
+        # 清掉失效 id,改开新对话重试,别让私聊 agent 整个挂掉。
+        if resume is None:
+            raise
+        log.warning("resume 会话 %s 失效(%r),清掉改开新对话", resume, e)
+        _chat_sessions.pop(user_id, None)
+        await s.close()
+        s = _ClientSession(_build(None))
+        await s.ensure_connected()
     _client_sessions[user_id] = s
     return s
 
@@ -630,7 +656,7 @@ async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/auth <6 位 TOTP>` — 验证后开 72h session,活跃自动续期。"""
+    """`/auth <6 位 TOTP>` — 验证后开 session(时长见 rules.SESSION_DURATION),活跃自动续期。"""
     user = update.effective_user
     msg = update.effective_message
     if user is None or user.id not in ADMIN_USER_IDS:
@@ -666,7 +692,7 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _save_state()
         await context.bot.send_message(
             user.id,
-            f"✅ 验证通过。72h session 已开,每次发消息自动续 72h。\n`/logout` 主动结束。",
+            f"✅ 验证通过。session 已开(有效 {_session_dur_label()},每次发消息自动续)。\n`/logout` 主动结束。",
             parse_mode="Markdown",
         )
         return
@@ -1537,6 +1563,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"消息: `{base_text[:120]}`\n"
                 f"_第 3 次会自动 delete_ban_"
             ))
+
+    # 预过滤:自制 sticker(来自 @fStikBot / @Stickers 等创建者 bot)
+    # — pack 名格式 *_by_<xxx>Bot,图像内容含 QR/联系方式/广告 banner,
+    # classifier 看不到图像,只看 emoji + pack 名,几乎必漏判。
+    # 粗暴策略:任何自制 sticker 直接 delete_mute(禁言 24h)。
+    # 误伤代价 = 群友自制 meme 表情被禁一天,正常 meme 通常用 Telegram 官方 sticker pack。
+    if msg.sticker and msg.sticker.set_name:
+        sn = msg.sticker.set_name.lower()
+        if "_by_" in sn and sn.endswith("bot"):
+            log.warning(
+                "custom-sticker pre-filter: user=%s pack=%s",
+                user.id if user else "?", msg.sticker.set_name,
+            )
+            verdict = Verdict(
+                is_spam=True,
+                category="other_spam",
+                confidence=0.9,
+                reason=f"自制 sticker pack={msg.sticker.set_name},图像无法 OCR,高广告概率",
+                action="delete_mute",
+            )
+            await _act(context, update, verdict)
+            return
 
     try:
         verdict = await llm_router.classify(

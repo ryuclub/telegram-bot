@@ -27,7 +27,7 @@ USER_HISTORY_WINDOW = timedelta(hours=24)
 
 # === Admin TOTP session ===
 # /auth 通过后,session 在此时长内有效;每次活跃自动续到此时长
-SESSION_DURATION = timedelta(hours=72)
+SESSION_DURATION = timedelta(days=30)  # 30 天;每次活跃自动续 30 天,/logout 主动退
 
 # === CAS 缓存与刷新 ===
 # 全量本地 sqlite 每隔多久重新下一次 export.csv
