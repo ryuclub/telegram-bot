@@ -11,3 +11,6 @@ venv/
 data/
 .totp-secret
 .session-state.json
+bot.err.log
+bot.out.log
+.totp-setup-done
